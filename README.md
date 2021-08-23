@@ -12,3 +12,14 @@ This works by relying on seccomp-ebpf, which ensures all the children will be ha
    What we'll do here, is to hook onto the execve return, before the elf interp or the static binary has any chance to run or lookup anything, and we'll rewrite the vdso pointer right from underneath.
 
  - syscalls `clock_gettime`, `gettimeofday`, just the regular way.
+
+## Demo
+
+```
+./emmett bash -xc "date; sleep 2; date" 2>&1
++ date
+Thu Jan  1 12:00:42 AM UTC 1970
++ sleep 2
++ date
+Thu Jan  1 12:00:42 AM UTC 1970
+```
