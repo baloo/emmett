@@ -30,11 +30,6 @@
 #define ROUND_DOWN(N, S) ((N / S) * S)
 
 static void process_signals(pid_t child);
-static int wait_for_syscall(pid_t child);
-static void read_file(pid_t child, char *file);
-static void redirect_file(pid_t child, const char *file);
-
-enum { EXECVE, CLOCK_GETTIME, GETTIMEOFDAY, UNKNOWN };
 
 GHashTable *htable;
 
@@ -416,6 +411,9 @@ static void process_signals(pid_t child)
 			// Here we're looking for the AT_SYSINFO_EHDR element of
 			// the auxiliary vector we'll get the address in the
 			// vector, and where it points to.
+			//
+			// Stack layout documentation:
+			//   https://lwn.net/Articles/631631/
 
 			// Fetch the stack address
 			ptrace(PTRACE_GETREGS, pid, NULL, &saved_regs);
