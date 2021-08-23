@@ -1,0 +1,4 @@
+*.o
+emmett
+debug
+vdso.so
