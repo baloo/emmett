@@ -33,20 +33,10 @@ static void process_signals(pid_t child);
 
 GHashTable *htable;
 
-enum child_state {
-	ptrace_detached = 0,
-	ptrace_at_syscall,
-	ptrace_after_syscall,
-	ptrace_running,
-	ptrace_stopped,
-	ptrace_exited
-};
-
 struct watched_task {
 	pid_t pid;
 	bool in_exec;
 	bool is_root;
-	enum child_state state;
 	struct user user;
 	int status;
 	int error;
@@ -64,82 +54,6 @@ static void task_destroy(void *data, void *user_data)
 	if (task)
 		free(task);
 }
-
-int ptrace_wait(struct watched_task *child)
-{
-	if (waitpid(child->pid, &child->status, 0) < 0) {
-		child->error = errno;
-		return -1;
-	}
-	if (WIFEXITED(child->status) || WIFSIGNALED(child->status)) {
-		child->state = ptrace_exited;
-	} else if (WIFSTOPPED(child->status)) {
-		int sig = WSTOPSIG(child->status);
-		if (sig & 0x80) {
-			child->state = (child->state == ptrace_at_syscall)
-					   ? ptrace_after_syscall
-					   : ptrace_at_syscall;
-		} else {
-			if (child->state != ptrace_at_syscall)
-				child->state = ptrace_stopped;
-		}
-	} else {
-		child->error = EINVAL;
-		return -1;
-	}
-	return 0;
-}
-
-int ptrace_advance_to_state(struct watched_task *child,
-			    enum child_state desired)
-{
-	int err;
-	while (child->state != desired) {
-		switch (desired) {
-		case ptrace_after_syscall:
-		case ptrace_at_syscall:
-			if (WIFSTOPPED(child->status) &&
-			    WSTOPSIG(child->status) == SIGSEGV) {
-				child->error = EAGAIN;
-				return -1;
-			}
-			err = ptrace(PTRACE_SYSCALL, child->pid, 0, 0);
-			break;
-		case ptrace_running:
-			return ptrace(PTRACE_CONT, child->pid, 0, 0);
-		case ptrace_stopped:
-			err = kill(child->pid, SIGSTOP);
-			if (err < 0)
-				child->error = errno;
-			break;
-		default:
-			child->error = EINVAL;
-			return -1;
-		}
-		if (err < 0)
-			return err;
-		if (ptrace_wait(child) < 0)
-			return -1;
-	}
-	return 0;
-}
-
-struct ptrace_personality {
-	size_t syscall_rv;
-	size_t syscall_arg0;
-	size_t syscall_arg1;
-	size_t syscall_arg2;
-	size_t syscall_arg3;
-	size_t syscall_arg4;
-	size_t syscall_arg5;
-	size_t reg_ip;
-};
-static struct ptrace_personality amd64_personality = {
-    offsetof(struct user, regs.rax), offsetof(struct user, regs.rdi),
-    offsetof(struct user, regs.rsi), offsetof(struct user, regs.rdx),
-    offsetof(struct user, regs.r10), offsetof(struct user, regs.r8),
-    offsetof(struct user, regs.r9),  offsetof(struct user, regs.rip),
-};
 
 int ptrace_memcpy_from_child(struct watched_task *child, void *dst,
 			     unsigned long src, size_t n)
