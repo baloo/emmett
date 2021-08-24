@@ -136,6 +136,7 @@ void *ptrace_remote_syscall(struct watched_task *child, unsigned long sysno,
 
 	struct user_regs_struct old_regs;
 	ptrace(PTRACE_GETREGS, child->pid, NULL, &old_regs);
+	ptrace(PTRACE_SETREGS, child->pid, NULL, &old_regs);
 
 	void *injection_address =
 	    (void *)ROUND_DOWN(old_regs.rip, sizeof(unsigned long));
@@ -163,13 +164,23 @@ void *ptrace_remote_syscall(struct watched_task *child, unsigned long sysno,
 			       new_data, sizeof(new_data));
 
 	ptrace(PTRACE_SETREGS, child->pid, NULL, &regs);
-	ptrace(PTRACE_CONT, child->pid, NULL, NULL);
-	// We wrote int3 after the syscall, so the process will immediately
-	// sigtrap on return.
-	waitpid(child->pid, &child->status, WSTOPPED);
-	// Read back the result
-	ptrace(PTRACE_GETREGS, child->pid, NULL, &regs);
-	rv = (void *)regs.rax;
+
+	do {
+		// For some reason, we need to PTRACE_CONT twice. We're only
+		// called from a syscall-exit-stop location, so we should be
+		// able to re-enter a syscall immediately, but RIP only bumps on
+		// the second try.
+
+		ptrace(PTRACE_CONT, child->pid, NULL, NULL);
+		// We wrote int3 after the syscall, so the process will
+		// immediately sigtrap on return.
+		waitpid(child->pid, &child->status, WSTOPPED);
+		// Read back the result
+		ptrace(PTRACE_GETREGS, child->pid, NULL, &regs);
+		rv = (void *)regs.rax;
+	} while (regs.rip ==
+		 injection_address); // If the screw does not go in, you just
+				     // need a bigger hammer.
 
 	// Restore the context
 	ptrace(PTRACE_SETREGS, child->pid, NULL, &old_regs);
@@ -226,9 +237,9 @@ int main(int argc, char **argv)
 	} else {
 		waitpid(pid, &status, 0);
 		ptrace(PTRACE_SETOPTIONS, pid, 0,
-		       PTRACE_O_TRACESECCOMP | PTRACE_O_EXITKILL |
-			   PTRACE_O_TRACEEXEC | PTRACE_O_TRACECLONE |
-			   PTRACE_O_TRACEFORK);
+		       PTRACE_O_TRACESECCOMP/* | PTRACE_O_EXITKILL |
+			   PTRACE_O_TRACEEXEC  | PTRACE_O_TRACECLONE |
+			   PTRACE_O_TRACEFORK*/);
 
 		htable = g_hash_table_new_full(NULL, NULL, NULL,
 					       (GDestroyNotify)task_destroy);
@@ -252,6 +263,7 @@ static void process_signals(pid_t child)
 	ptrace(PTRACE_CONT, child, 0, 0);
 	while (1) {
 		pid_t pid = wait(&status);
+		printf("pid %d status %x\n", pid, status);
 		struct watched_task *task =
 		    g_hash_table_lookup(htable, (gpointer)pid);
 
@@ -267,12 +279,41 @@ static void process_signals(pid_t child)
 
 			ptrace(PTRACE_CONT, pid, 0, 0);
 			continue;
+		} else if (status >> 8 ==
+			       (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)) &&
+			   ptrace(PTRACE_PEEKUSER, pid, sizeof(long) * ORIG_RAX,
+				  0) == __NR_execve) {
+			printf("SECCOMP execve\n");
+			struct watched_task *task = task_create();
+			task->pid = pid;
+			task->in_exec = true;
+			task->is_root = pid==child;
+			g_hash_table_insert(htable, (gpointer)pid, task);
+
+			//
+			//        Functionally, a PTRACE_EVENT_SECCOMP stop
+			//        functions comparably to a syscall-entry-stop
+			//        (i.e., continuations  using  PTRACE_SYSCALL
+			//               will cause syscall-exit-stops, the
+			//               system call number may be changed and
+			//               any other modified registers are
+			//               visible to the to-be-ex‐
+			//                      ecuted system call as well).
+			//                      Note that there may be, but need
+			//                      not have been a preceding
+			//                      syscall-entry-stop.
+			ptrace(PTRACE_SYSCALL, pid, 0, 0);
+			continue;
 		}
+		printf("task %p\n", task);
 
 		if (task == NULL)
 			continue;
+		printf("task->in_exec %d \n", task->in_exec);
 
 		int stop_sig = WSTOPSIG(status);
+		printf("stop_sig %d status >> 8 = %d \n", stop_sig,
+		       status >> 8);
 
 		/* Is it our filter for the execve syscall? */
 		if (status >> 8 == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)) &&
@@ -300,9 +341,11 @@ static void process_signals(pid_t child)
 				ptrace(PTRACE_SYSCALL, pid, 0, 0);
 				continue;
 			}
-		} else if (status >> 8 == SIGTRAP && task->in_exec) {
+			//} else if (status >> 8 == SIGTRAP && task->in_exec) {
+		} else if (stop_sig == SIGTRAP && task->in_exec) {
 			int ret_val =
 			    ptrace(PTRACE_PEEKUSER, pid, sizeof(long) * RAX, 0);
+			printf("in_exec %d\n", ret_val);
 			task->in_exec = false;
 			// Get the auxilliary vector, and reinject it
 			// with our modified vdso
@@ -332,10 +375,12 @@ static void process_signals(pid_t child)
 			// Fetch the stack address
 			ptrace(PTRACE_GETREGS, pid, NULL, &saved_regs);
 			unsigned long rsp = saved_regs.rsp;
+			printf("rsp %p\n", rsp);
 
 			long child_addr;
 			long argc = (long)ptrace(PTRACE_PEEKTEXT, pid, rsp, 0);
 			// Don't need to read argv
+			printf("argc %d\n", argc);
 
 			// We now need to read the environ.
 			unsigned long envp = saved_regs.rsp + 0x8 * (argc + 2);
@@ -363,6 +408,7 @@ static void process_signals(pid_t child)
 
 				offset += 0x10;
 			}
+			printf("vdso %p\n", vdso);
 
 			if (vdso != 0) {
 				// we now have the vdso address
@@ -381,6 +427,7 @@ static void process_signals(pid_t child)
 				    task, __NR_mmap, NULL, new_vdso_size,
 				    PROT_READ | PROT_WRITE,
 				    MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+				printf("new_vdso_addr %p\n", new_vdso_addr);
 				void *vdso_content =
 				    mmap(NULL, sb.st_size, PROT_READ,
 					 MAP_SHARED, vdso_fd, 0);
@@ -404,15 +451,18 @@ static void process_signals(pid_t child)
 				    (long)ptrace(PTRACE_POKETEXT, pid,
 						 vdso_reg_addr, new_vdso_addr);
 			}
+			printf("done inject\n");
 
 			ptrace(PTRACE_CONT, pid, 0, 0);
 
 		} else if (WIFEXITED(status)) {
+			printf("task->isroot %d pid=%d task->pid=%d child=%d\n", task->is_root, pid, task->pid, child);
 			if (task->is_root)
 				return;
+			printf("exited\n");
 
 			g_hash_table_remove(htable, (gpointer)pid);
-			ptrace(PTRACE_CONT, pid, 0, 0);
+			//ptrace(PTRACE_CONT, pid, 0, 0);
 		} else {
 			// Not an handled signal, just let the program
 			// go, should it raise in seccomp kernel will
